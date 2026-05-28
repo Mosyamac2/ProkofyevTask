@@ -35,6 +35,16 @@ JUDGE_TOP_K = 5                  # сколько кандидатов отда�
 JUDGE_REQ_TIMEOUT = 120          # таймаут одного chat-запроса (сек)
 EMBED_REQ_TIMEOUT = 60
 
+# ─── Rate-limiting GigaChat ──────────────────────────────────────────────
+# GigaChat-2-Max в свободном тарифе режет нас по RPS на chat/completions.
+# Все настройки переопределяются переменными окружения.
+JUDGE_PARALLELISM = int(os.getenv("JUDGE_PARALLELISM", "1"))
+JUDGE_MIN_INTERVAL_SEC = float(os.getenv("JUDGE_MIN_INTERVAL_SEC", "1.2"))
+EMBED_MIN_INTERVAL_SEC = float(os.getenv("EMBED_MIN_INTERVAL_SEC", "0.0"))
+RETRY_MAX_ATTEMPTS = int(os.getenv("RETRY_MAX_ATTEMPTS", "8"))
+RETRY_MAX_WAIT_SEC = float(os.getenv("RETRY_MAX_WAIT_SEC", "60"))
+JUDGE_FLUSH_EVERY = int(os.getenv("JUDGE_FLUSH_EVERY", "25"))
+
 # Retrieval-объединение
 RRF_K = 60                        # параметр Reciprocal Rank Fusion
 

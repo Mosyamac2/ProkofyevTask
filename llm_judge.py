@@ -24,7 +24,7 @@ import gigachat_client
 
 log = logging.getLogger(__name__)
 
-JUDGE_PARALLELISM = 6
+JUDGE_PARALLELISM = config.JUDGE_PARALLELISM
 _cache_lock = threading.Lock()
 
 SYSTEM_PROMPT = (
@@ -143,44 +143,68 @@ def judge_single(query_text: str, scen_rows: list[dict], cache: dict[str, dict])
     return result
 
 
+def _safe_judge(idx: int, query: str, cands: list[dict], cache: dict[str, dict]) -> tuple[int, JudgeResult]:
+    """Обёртка вокруг judge_single, которая никогда не бросает.
+
+    Любая ошибка → JudgeResult('error', ...). Это критично: одна 429 не должна
+    тащить за собой как минимум часть уже посчитанных вердиктов из памяти.
+    """
+    try:
+        return idx, judge_single(query, cands, cache)
+    except Exception as exc:  # noqa: BLE001 — намеренно ловим всё
+        msg = f"{type(exc).__name__}: {exc}"[:300]
+        log.warning("Judge error at idx=%d: %s", idx, msg)
+        return idx, JudgeResult("error", None, 0.0, msg)
+
+
 def judge_all(
     queries: list[str],
     candidates_per_query: list[list[dict]],
     cache_path: Path | None = None,
-    flush_every: int = 100,
-    parallelism: int = JUDGE_PARALLELISM,
+    flush_every: int | None = None,
+    parallelism: int | None = None,
 ) -> list[JudgeResult]:
     """Прогоняет LLM-судью по всем запросам, инкрементально сохраняет кеш.
 
-    Параллелит запросы пулом потоков (ThreadPool — IO-bound, GIL не мешает).
+    - Параллелит пулом потоков, если parallelism>1; иначе работает последовательно
+      (что предпочтительно при включённом throttle в gigachat_client).
+    - Любая ошибка одного future фиксируется как verdict='error' и не валит весь
+      прогон. Кеш сохраняется каждые `flush_every` завершённых задач и в finally
+      (даже при KeyboardInterrupt).
     """
     cache_path = cache_path or config.JUDGE_CACHE_PATH
+    flush_every = flush_every if flush_every is not None else config.JUDGE_FLUSH_EVERY
+    parallelism = parallelism if parallelism is not None else config.JUDGE_PARALLELISM
+
     cache = _load_cache(cache_path)
 
     items = list(zip(queries, candidates_per_query))
     results: list[JudgeResult | None] = [None] * len(items)
+    completed = 0
 
-    misses_since_flush = 0
-
-    def _work(idx_q_cands):
-        i, q, cands = idx_q_cands
-        return i, judge_single(q, cands, cache)
-
-    tasks = [(i, q, c) for i, (q, c) in enumerate(items)]
-
-    with ThreadPoolExecutor(max_workers=parallelism) as ex:
-        futs = [ex.submit(_work, t) for t in tasks]
-        for f in tqdm(as_completed(futs), total=len(futs), desc="LLM judge", unit="q"):
-            i, res = f.result()
-            results[i] = res
-            misses_since_flush += 1
-            if misses_since_flush >= flush_every:
-                with _cache_lock:
-                    _save_cache(cache, cache_path)
-                misses_since_flush = 0
-
-    if misses_since_flush:
+    def _flush() -> None:
         with _cache_lock:
             _save_cache(cache, cache_path)
+
+    try:
+        if parallelism <= 1:
+            iterator = tqdm(enumerate(items), total=len(items), desc="LLM judge", unit="q")
+            for i, (q, c) in iterator:
+                _, res = _safe_judge(i, q, c, cache)
+                results[i] = res
+                completed += 1
+                if completed % flush_every == 0:
+                    _flush()
+        else:
+            with ThreadPoolExecutor(max_workers=parallelism) as ex:
+                futs = [ex.submit(_safe_judge, i, q, c, cache) for i, (q, c) in enumerate(items)]
+                for f in tqdm(as_completed(futs), total=len(futs), desc="LLM judge", unit="q"):
+                    i, res = f.result()  # _safe_judge не бросает
+                    results[i] = res
+                    completed += 1
+                    if completed % flush_every == 0:
+                        _flush()
+    finally:
+        _flush()
 
     return [r if r is not None else JudgeResult("error", None, 0.0, "missing") for r in results]
