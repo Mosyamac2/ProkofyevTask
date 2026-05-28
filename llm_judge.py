@@ -1,8 +1,9 @@
-"""Stage D — LLM cross-encoder.
+"""LLM-судья (одна пара за раз, бинарный вердикт).
 
-Для каждого реального запроса даём LLM сам запрос и top-K сценариев-кандидатов.
-LLM возвращает JSON: какой кандидат покрывает запрос (или ни один), уверенность,
-короткое обоснование. Все ответы кешируются на диске.
+Используется только для разметки случайной выборки пар (real_query → top-1 scenario),
+по которой подбирается порог по score_rrf. Никаких top-K, никаких grey-zone циклов.
+
+Кеш на диске — sha1(model::query::scenario). Повторные прогоны не дёргают API.
 """
 from __future__ import annotations
 
@@ -11,10 +12,9 @@ import json
 import logging
 import re
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import List
+from typing import Iterable
 
 import pandas as pd
 from tqdm import tqdm
@@ -24,38 +24,34 @@ import gigachat_client
 
 log = logging.getLogger(__name__)
 
-JUDGE_PARALLELISM = config.JUDGE_PARALLELISM
 _cache_lock = threading.Lock()
 
 SYSTEM_PROMPT = (
     "Ты помогаешь HR-аналитику проверить, покрывает ли каталог сценариев реальные "
-    "запросы пользователей внутренней HR-системы Сбера «Пульс». Тебе дают один "
-    "реальный запрос сотрудника и список из {k} сценариев-кандидатов из каталога. "
-    "Для каждого сценария указаны его категория и тип действия. "
-    "Твоя задача — определить, есть ли среди кандидатов сценарий, который "
-    "ПОКРЫВАЕТ намерение пользователя.\n\n"
-    "ПОКРЫВАЕТ = одинаковое намерение (что хочет сделать) и одинаковый тип действия "
-    "(поиск информации / выполнение / помощь). Просто общая тема — этого мало.\n\n"
-    "ВЕРДИКТЫ:\n"
-    "- covered: один из кандидатов точно покрывает запрос — назови его номер.\n"
-    "- partial: кандидат близок по теме, но намерение или scope другие.\n"
-    "- oos:    ни один кандидат не покрывает запрос (out-of-scope для каталога).\n\n"
-    "ОТВЕТ — строго JSON без обёртки:\n"
-    "{{\"verdict\": \"covered|partial|oos\", \"chosen\": <int|null>, "
-    "\"confidence\": <0..1>, \"reason\": \"...\"}}"
+    "запросы сотрудников внутренней HR-системы Сбера «Пульс». Тебе дают ОДИН "
+    "реальный запрос сотрудника и ОДИН сценарий из каталога (с его категорией и "
+    "типом действия).\n\n"
+    "Реши: покрывает ли сценарий реальный запрос?\n"
+    "ПОКРЫВАЕТ = одинаковое НАМЕРЕНИЕ (что хочет сделать пользователь) и одинаковый "
+    "ОБЪЕКТ запроса. Просто общая тема (например, оба про отпуска) — этого мало.\n\n"
+    "Ответ — СТРОГО JSON без обёртки, одна строка:\n"
+    "{\"match\": 0|1, \"reason\": \"кратко, до 100 символов\"}\n"
+    "1 = сценарий покрывает запрос, 0 = не покрывает."
 )
 
 
 @dataclass
 class JudgeResult:
-    verdict: str           # 'covered' | 'partial' | 'oos' | 'error'
-    chosen: int | None     # 1-based индекс кандидата
-    confidence: float
+    match: int        # 1 covered, 0 not covered, -1 error
     reason: str
 
+    @property
+    def ok(self) -> bool:
+        return self.match in (0, 1)
 
-def _key(query: str, candidates_payload: str, model: str) -> str:
-    blob = f"{model}::{query}\n---\n{candidates_payload}"
+
+def _key(query: str, scenario_payload: str, model: str) -> str:
+    blob = f"{model}::{query}\n---\n{scenario_payload}"
     return hashlib.sha1(blob.encode("utf-8")).hexdigest()
 
 
@@ -68,7 +64,10 @@ def _load_cache(path: Path) -> dict[str, dict]:
 
 def _save_cache(cache: dict[str, dict], path: Path) -> None:
     df = pd.DataFrame(
-        {"key": list(cache.keys()), "payload": [json.dumps(v, ensure_ascii=False) for v in cache.values()]}
+        {
+            "key": list(cache.keys()),
+            "payload": [json.dumps(v, ensure_ascii=False) for v in cache.values()],
+        }
     )
     tmp = path.with_suffix(path.suffix + ".tmp")
     df.to_parquet(tmp, index=False)
@@ -80,131 +79,81 @@ _JSON_RE = re.compile(r"\{.*\}", flags=re.DOTALL)
 
 def _parse_response(raw: str) -> JudgeResult:
     if not raw:
-        return JudgeResult("error", None, 0.0, "empty response")
+        return JudgeResult(-1, "empty response")
     m = _JSON_RE.search(raw)
     if not m:
-        return JudgeResult("error", None, 0.0, f"no json in: {raw[:200]}")
+        return JudgeResult(-1, f"no json: {raw[:200]}")
     try:
         d = json.loads(m.group(0))
     except json.JSONDecodeError as e:
-        return JudgeResult("error", None, 0.0, f"json parse error: {e}; raw={raw[:200]}")
-    verdict = str(d.get("verdict", "")).lower().strip()
-    if verdict not in {"covered", "partial", "oos"}:
-        verdict = "error"
-    chosen = d.get("chosen")
-    if chosen is not None:
-        try:
-            chosen = int(chosen)
-        except (TypeError, ValueError):
-            chosen = None
+        return JudgeResult(-1, f"json parse: {e}; raw={raw[:200]}")
     try:
-        conf = float(d.get("confidence", 0.0))
+        match = int(d.get("match", -1))
     except (TypeError, ValueError):
-        conf = 0.0
-    reason = str(d.get("reason", ""))[:500]
-    return JudgeResult(verdict, chosen, conf, reason)
+        match = -1
+    if match not in (0, 1):
+        match = -1
+    reason = str(d.get("reason", ""))[:200]
+    return JudgeResult(match, reason)
 
 
-def _format_candidates(scen_rows: list[dict]) -> str:
-    lines = []
-    for i, s in enumerate(scen_rows, start=1):
-        cat = s.get("category", "")
-        atype = s.get("action_type", "")
-        text = s.get("scenario_query", "")
-        lines.append(f"{i}. [{cat}] [{atype}] {text}")
-    return "\n".join(lines)
+def _format_scenario(scen: dict) -> str:
+    cat = scen.get("category", "")
+    atype = scen.get("action_type", "")
+    text = scen.get("scenario_query", "")
+    return f"[{cat}] [{atype}] {text}"
 
 
-def _build_messages(query_text: str, scen_rows: list[dict]) -> tuple[str, list[dict]]:
-    cand_block = _format_candidates(scen_rows)
-    key = _key(query_text, cand_block, config.GIGACHAT_CHAT_MODEL)
-    system = SYSTEM_PROMPT.format(k=len(scen_rows))
-    user = (
-        f"РЕАЛЬНЫЙ ЗАПРОС:\n{query_text}\n\n"
-        f"КАНДИДАТЫ:\n{cand_block}\n\n"
-        "Ответь JSON по схеме."
-    )
-    return key, [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user},
-    ]
-
-
-def judge_single(query_text: str, scen_rows: list[dict], cache: dict[str, dict]) -> JudgeResult:
-    key, messages = _build_messages(query_text, scen_rows)
+def judge_pair(query_text: str, scenario: dict, cache: dict[str, dict] | None = None) -> JudgeResult:
+    """Один LLM-вызов: пара (запрос, сценарий) → 0/1."""
+    if cache is None:
+        cache = _load_cache(config.JUDGE_CACHE_PATH)
+    scen_str = _format_scenario(scenario)
+    key = _key(query_text, scen_str, config.GIGACHAT_CHAT_MODEL)
     with _cache_lock:
         cached = cache.get(key)
     if cached is not None:
         return JudgeResult(**cached)
-    raw = gigachat_client.chat_completion(messages)
-    result = _parse_response(raw)
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": f"РЕАЛЬНЫЙ ЗАПРОС:\n{query_text}\n\nСЦЕНАРИЙ:\n{scen_str}\n\nОтветь JSON."},
+    ]
+    try:
+        raw = gigachat_client.chat_completion(messages, max_tokens=200)
+        result = _parse_response(raw)
+    except Exception as exc:  # noqa: BLE001
+        result = JudgeResult(-1, f"{type(exc).__name__}: {exc}"[:200])
+
     with _cache_lock:
         cache[key] = asdict(result)
     return result
 
 
-def _safe_judge(idx: int, query: str, cands: list[dict], cache: dict[str, dict]) -> tuple[int, JudgeResult]:
-    """Обёртка вокруг judge_single, которая никогда не бросает.
-
-    Любая ошибка → JudgeResult('error', ...). Это критично: одна 429 не должна
-    тащить за собой как минимум часть уже посчитанных вердиктов из памяти.
-    """
-    try:
-        return idx, judge_single(query, cands, cache)
-    except Exception as exc:  # noqa: BLE001 — намеренно ловим всё
-        msg = f"{type(exc).__name__}: {exc}"[:300]
-        log.warning("Judge error at idx=%d: %s", idx, msg)
-        return idx, JudgeResult("error", None, 0.0, msg)
-
-
-def judge_all(
-    queries: list[str],
-    candidates_per_query: list[list[dict]],
+def judge_pairs(
+    pairs: Iterable[tuple[str, dict]],
     cache_path: Path | None = None,
     flush_every: int | None = None,
-    parallelism: int | None = None,
 ) -> list[JudgeResult]:
-    """Прогоняет LLM-судью по всем запросам, инкрементально сохраняет кеш.
-
-    - Параллелит пулом потоков, если parallelism>1; иначе работает последовательно
-      (что предпочтительно при включённом throttle в gigachat_client).
-    - Любая ошибка одного future фиксируется как verdict='error' и не валит весь
-      прогон. Кеш сохраняется каждые `flush_every` завершённых задач и в finally
-      (даже при KeyboardInterrupt).
-    """
+    """Прогоняет последовательность пар через судью, кеш сохраняет каждые
+    `flush_every` запросов и в finally."""
     cache_path = cache_path or config.JUDGE_CACHE_PATH
     flush_every = flush_every if flush_every is not None else config.JUDGE_FLUSH_EVERY
-    parallelism = parallelism if parallelism is not None else config.JUDGE_PARALLELISM
 
     cache = _load_cache(cache_path)
-
-    items = list(zip(queries, candidates_per_query))
-    results: list[JudgeResult | None] = [None] * len(items)
-    completed = 0
+    pairs_list = list(pairs)
+    results: list[JudgeResult] = []
 
     def _flush() -> None:
         with _cache_lock:
             _save_cache(cache, cache_path)
 
     try:
-        if parallelism <= 1:
-            iterator = tqdm(enumerate(items), total=len(items), desc="LLM judge", unit="q")
-            for i, (q, c) in iterator:
-                _, res = _safe_judge(i, q, c, cache)
-                results[i] = res
-                completed += 1
-                if completed % flush_every == 0:
-                    _flush()
-        else:
-            with ThreadPoolExecutor(max_workers=parallelism) as ex:
-                futs = [ex.submit(_safe_judge, i, q, c, cache) for i, (q, c) in enumerate(items)]
-                for f in tqdm(as_completed(futs), total=len(futs), desc="LLM judge", unit="q"):
-                    i, res = f.result()  # _safe_judge не бросает
-                    results[i] = res
-                    completed += 1
-                    if completed % flush_every == 0:
-                        _flush()
+        for i, (q, scen) in enumerate(tqdm(pairs_list, desc="LLM judge", unit="q")):
+            results.append(judge_pair(q, scen, cache=cache))
+            if (i + 1) % flush_every == 0:
+                _flush()
     finally:
         _flush()
 
-    return [r if r is not None else JudgeResult("error", None, 0.0, "missing") for r in results]
+    return results

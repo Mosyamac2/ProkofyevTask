@@ -18,7 +18,7 @@ CACHE_DIR.mkdir(exist_ok=True)
 OUT_DIR.mkdir(exist_ok=True)
 
 EMBED_CACHE_PATH = CACHE_DIR / "embeddings.parquet"
-JUDGE_CACHE_PATH = CACHE_DIR / "judge_cache.parquet"
+JUDGE_CACHE_PATH = CACHE_DIR / "judge_binary_cache.parquet"
 INTERMEDIATE_DIR = CACHE_DIR / "intermediate"
 INTERMEDIATE_DIR.mkdir(exist_ok=True)
 
@@ -31,9 +31,27 @@ GIGACHAT_VERIFY_SSL = os.getenv("GIGACHAT_VERIFY_SSL", "false").lower() == "true
 
 # Параметры пайплайна
 EMBED_BATCH_SIZE = 50            # сколько строк за один embeddings-запрос
-JUDGE_TOP_K = 5                  # сколько кандидатов отдавать LLM-судье
+JUDGE_TOP_K = 5                  # сколько кандидатов хранить в матчах (для прозрачности),
+                                 # бинарный судья смотрит только на top-1
 JUDGE_REQ_TIMEOUT = 120          # таймаут одного chat-запроса (сек)
 EMBED_REQ_TIMEOUT = 60
+
+# ─── Выбор порога через бинарного судью на случайной выборке ─────────────
+# Берём N случайных пар (real_query → top-1 scenario), судья даёт 1/0,
+# далее ищем порог по score_rrf, максимизирующий F-beta (positive = oos).
+JUDGE_SAMPLE_N = int(os.getenv("JUDGE_SAMPLE_N", "100"))
+JUDGE_FBETA = float(os.getenv("JUDGE_FBETA", "0.5"))   # F0.5: precision(oos) важнее recall
+                                                       # (на нашем 70/30 imbalance F1/F2 деградируют)
+JUDGE_SAMPLE_SEED = int(os.getenv("JUDGE_SAMPLE_SEED", "42"))
+# random — чистый случайный выбор; stratified — по децилям score_rrf, чтобы
+# выборка содержала запросы и из «вероятно покрыт», и из «вероятно oos» хвостов.
+JUDGE_SAMPLE_STRATEGY = os.getenv("JUDGE_SAMPLE_STRATEGY", "stratified").lower()
+JUDGE_SAMPLE_BINS = int(os.getenv("JUDGE_SAMPLE_BINS", "10"))
+
+# Запасной порог по score_embed (cosine), если LLM-судья выключен (--no-llm).
+# Для GigaChat EmbeddingsGigaR на русском типичный диапазон [0.3, 0.85].
+# 0.60 ≈ умеренно похоже (для калибровки берётся реальное значение из выборки).
+FALLBACK_THRESHOLD_EMBED = float(os.getenv("FALLBACK_THRESHOLD_EMBED", "0.60"))
 
 # ─── Rate-limiting GigaChat ──────────────────────────────────────────────
 # GigaChat-2-Max в свободном тарифе режет нас по RPS на chat/completions.
@@ -56,10 +74,6 @@ BUTTON_MIN_COUNT = 5              # мин. частота, чтобы вооб�
 # Фильтрация мусора
 MIN_QUERY_LEN_CHARS = 3
 MAX_QUERY_LEN_CHARS = 1000
-
-# Калибровка / бакетизация (используется как fallback; основной вердикт — у Stage D)
-COVERED_PROB_THRESHOLD = 0.70     # P(match) >= → точно покрыт
-OOS_PROB_THRESHOLD = 0.30         # P(match) <  → совсем не похоже
 
 # Кластеризация gap-ов
 CLUSTER_MIN_SIZE = 6

@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Local secrets — note: .env is already tracked from initial commit;
+# remove from index with `git rm --cached .env` to stop tracking it.
+
+# Pipeline outputs and run artifacts
+out/
+cache/
+*.log
+
+# Deliverables
+pulse_coverage_report_*/
+pulse_coverage_report_*.zip
+out_dwnld*.zip
+
+# Claude transcripts and tooling state
+*.jsonl
+.idea/
