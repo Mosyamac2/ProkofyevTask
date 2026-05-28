@@ -1,0 +1,16 @@
+pandas>=2.0
+openpyxl>=3.1
+numpy>=1.26
+scikit-learn>=1.4
+scipy>=1.11
+requests>=2.31
+tenacity>=8.2
+python-dotenv>=1.0
+tqdm>=4.66
+matplotlib>=3.8
+rank-bm25>=0.2.2
+rapidfuzz>=3.5
+pyarrow>=14.0
+gigachat>=0.1.30
+hdbscan>=0.8.33
+umap-learn>=0.5.5
